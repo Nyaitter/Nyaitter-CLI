@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Nyaitter CLI - Bash で利用可能な Nyaitter コマンドラインツール
+# ==============================================================================
+
+set -euo pipefail
+
+# シンボリックリンク解決
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+CONFIG_DIR="${HOME}/.config/nyaitter"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+# カラー定義
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_CYAN=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_RED=""
+  C_BLUE=""
+fi
+
+# ── 設定の読み書き ─────────────────────────────────────────────────────────────
+
+load_config() {
+  NYAITTER_URL="${NYAITTER_URL:-https://nyaitter.example.com}"
+  NYAITTER_TOKEN="${NYAITTER_TOKEN:-}"
+
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  cat <<CONF > "$CONFIG_FILE"
+NYAITTER_URL="${NYAITTER_URL}"
+NYAITTER_TOKEN="${NYAITTER_TOKEN}"
+CONF
+  chmod 600 "$CONFIG_FILE"
+}
+
+# ── API 呼び出しヘルパー ───────────────────────────────────────────────────────
+
+api_request() {
+  local method="$1"
+  local endpoint="$2"
+  local data="${3:-}"
+
+  local url="${NYAITTER_URL%/}${endpoint}"
+  local headers=("-H" "Accept: application/json")
+
+  if [ -n "$NYAITTER_TOKEN" ]; then
+    headers+=("-H" "Authorization: Bearer ${NYAITTER_TOKEN}")
+  fi
+
+  if [ -n "$data" ]; then
+    headers+=("-H" "Content-Type: application/json")
+    curl -s -X "$method" "${headers[@]}" -d "$data" "$url"
+  else
+    curl -s -X "$method" "${headers[@]}" "$url"
+  fi
+}
+
+# ── ヘルプ表示 ────────────────────────────────────────────────────────────────
+
+show_help() {
+  echo "${C_BOLD}🐾 Nyaitter CLI${C_RESET} - Bash で快適に使える Nyaitter コマンドラインツール"
+  echo ""
+  echo "${C_BOLD}使用法:${C_RESET}"
+  echo "  nyaitter <コマンド> [オプション] [引数...]"
+  echo ""
+  echo "${C_BOLD}TUI モード (端末フルスクリーン画面):${C_RESET}"
+  echo "  ${C_CYAN}tui, app${C_RESET}                      インタラクティブな TUI クライアントを起動"
+  echo ""
+  echo "${C_BOLD}設定・認証コマンド:${C_RESET}"
+  echo "  ${C_CYAN}config set url <URL>${C_RESET}          Nyaitter サーバー URL を設定 (デフォルト: https://nyaitter.example.com)"
+  echo "  ${C_CYAN}config set token <TOKEN>${C_RESET}      API キー / Bot トークンを設定"
+  echo "  ${C_CYAN}config get${C_RESET}                    現在の設定を表示"
+  echo "  ${C_CYAN}whoami${C_RESET}                        ログイン中のアカウント情報を表示"
+  echo ""
+  echo "${C_BOLD}投稿コマンド:${C_RESET}"
+  echo "  ${C_CYAN}post <本文>${C_RESET}                   新しいポストを投稿"
+  echo "      [-r, --reply-to <id>]           返信先ポストID"
+  echo "      [-q, --repost-to <id>]          引用先ポストID"
+  echo "      [-v, --visibility <type>]       公開範囲 (public / followers / direct)"
+  echo "  ${C_CYAN}tl, timeline${C_RESET}                  タイムラインを取得"
+  echo "      [-l, --limit <n>]               取得件数 (デフォルト: 20)"
+  echo "      [-t, --tab <foryou|following>]  タブ切り替え"
+  echo "  ${C_CYAN}show <id>${C_RESET}                     ポストの詳細を表示"
+  echo "  ${C_CYAN}delete <id>${C_RESET}                   ポストを削除"
+  echo "  ${C_CYAN}like <id>${C_RESET}                     ポストにいいね"
+  echo "  ${C_CYAN}unlike <id>${C_RESET}                   いいねを取り消し"
+  echo "  ${C_CYAN}repost <id>${C_RESET}                   ポストをリポスト"
+  echo "  ${C_CYAN}unrepost <id>${C_RESET}                 リポストを取り消し"
+  echo ""
+  echo "${C_BOLD}ユーザー・フォローコマンド:${C_RESET}"
+  echo "  ${C_CYAN}user <id|username>${C_RESET}            ユーザー情報を表示"
+  echo "  ${C_CYAN}follow <id>${C_RESET}                   ユーザーをフォロー"
+  echo "  ${C_CYAN}unfollow <id>${C_RESET}                 フォロー解除"
+  echo "  ${C_CYAN}following [id]${C_RESET}               フォロー中一覧"
+  echo "  ${C_CYAN}followers [id]${C_RESET}               フォロワー一覧"
+  echo ""
+  echo "${C_BOLD}通知・DMコマンド:${C_RESET}"
+  echo "  ${C_CYAN}notif, notifications${C_RESET}         通知一覧を取得"
+  echo "  ${C_CYAN}notif read [id]${C_RESET}              通知を既読化 (ID省略時は全既読)"
+  echo "  ${C_CYAN}dm list${C_RESET}                       DM チャンネル一覧"
+  echo "  ${C_CYAN}dm send <userId> <本文>${C_RESET}       DM メッセージを送信"
+  echo ""
+  echo "${C_BOLD}共通オプション:${C_RESET}"
+  echo "  ${C_CYAN}--json${C_RESET}                        結果を未整形の JSON 形式で出力 (jq 連携用)"
+  echo "  ${C_CYAN}--token <TOKEN>${C_RESET}               今回のみ使用するトークンを指定"
+  echo "  ${C_CYAN}--url <URL>${C_RESET}                   今回のみ使用するサーバー URL を指定"
+  echo "  ${C_CYAN}-h, --help${C_RESET}                    ヘルプを表示"
+}
+
+# ── メインルーチン ────────────────────────────────────────────────────────────
+
+load_config
+
+OPT_JSON=0
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      OPT_JSON=1
+      shift
+      ;;
+    --url)
+      NYAITTER_URL="$2"
+      shift 2
+      ;;
+    --token)
+      NYAITTER_TOKEN="$2"
+      shift 2
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ ${#ARGS[@]} -eq 0 ]; then
+  show_help
+  exit 0
+fi
+
+CMD="${ARGS[0]}"
+SUB_ARGS=("${ARGS[@]:1}")
+
+case "$CMD" in
+  # ── TUI クライアント ──────────────────────────────────────────────────────
+  tui|app)
+    if [ -f "${SCRIPT_DIR}/lib/tui.sh" ]; then
+      # shellcheck disable=SC1091
+      source "${SCRIPT_DIR}/lib/tui.sh"
+      run_tui
+    else
+      echo -e "${C_RED}❌ エラー: TUI モジュールが見つかりません (${SCRIPT_DIR}/lib/tui.sh)${C_RESET}" >&2
+      exit 1
+    fi
+    ;;
+
+  # ── 設定 ──────────────────────────────────────────────────────────────────
+  config)
+    ACTION="${SUB_ARGS[0]:-get}"
+    case "$ACTION" in
+      set)
+        KEY="${SUB_ARGS[1]:-}"
+        VAL="${SUB_ARGS[2]:-}"
+        if [ "$KEY" = "url" ]; then
+          NYAITTER_URL="$VAL"
+          save_config
+          echo -e "${C_GREEN}✅ Nyaitter URL を設定しました:${C_RESET} $VAL"
+        elif [ "$KEY" = "token" ]; then
+          NYAITTER_TOKEN="$VAL"
+          save_config
+          echo -e "${C_GREEN}✅ API トークンを設定しました:${C_RESET} ***${VAL: -4}"
+        else
+          echo -e "${C_RED}❌ エラー: 設定キーは url または token を指定してください。${C_RESET}" >&2
+          exit 1
+        fi
+        ;;
+      get)
+        if [ "$OPT_JSON" -eq 1 ]; then
+          printf '{"url":"%s","token":"%s"}\n' "$NYAITTER_URL" "$NYAITTER_TOKEN"
+        else
+          echo -e "${C_BOLD}現在の設定 (~/.config/nyaitter/config):${C_RESET}"
+          echo -e "  URL:   $NYAITTER_URL"
+          if [ -n "$NYAITTER_TOKEN" ]; then
+            echo -e "  Token: ***${NYAITTER_TOKEN: -4}"
+          else
+            echo -e "  Token: ${C_DIM}(未設定)${C_RESET}"
+          fi
+        fi
+        ;;
+    esac
+    ;;
+
+  # ── whoami ────────────────────────────────────────────────────────────────
+  whoami)
+    if [ -z "$NYAITTER_TOKEN" ]; then
+      echo -e "${C_YELLOW}⚠️ API トークンが未設定です。${C_RESET}" >&2
+      echo -e "\"nyaitter config set token <TOKEN>\" で設定してください。" >&2
+      exit 1
+    fi
+    RES=$(api_request GET "/auth/me")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '
+          (.user // .) |
+          if .id then
+            "👤 \u001b[1m\(.name // "No Name")\u001b[0m \u001b[2m(\(.nyaitter_id // ("#" + (.id|tostring))))\u001b[0m\n" +
+            "   Bio: \(.me // .bio // "なし")\n" +
+            "   Following: \(.following_count // .followingCount // 0) | Followers: \(.follower_count // .followersCount // 0) | Posts: \(.post_count // .postsCount // 0)"
+          else
+            "❌ ユーザー情報を取得できませんでした: \(.error // .message // "認証エラー")"
+          end
+        ' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── 投稿 ──────────────────────────────────────────────────────────────────
+  post|p)
+    CONTENT=""
+    REPLY_TO=""
+    REPOST_TO=""
+    VISIBILITY="public"
+
+    idx=0
+    while [[ $idx -lt ${#SUB_ARGS[@]} ]]; do
+      case "${SUB_ARGS[idx]}" in
+        -r|--reply-to)
+          REPLY_TO="${SUB_ARGS[idx+1]}"
+          idx=$((idx+2))
+          ;;
+        -q|--repost-to)
+          REPOST_TO="${SUB_ARGS[idx+1]}"
+          idx=$((idx+2))
+          ;;
+        -v|--visibility)
+          VISIBILITY="${SUB_ARGS[idx+1]}"
+          idx=$((idx+2))
+          ;;
+        *)
+          if [ -n "$CONTENT" ]; then
+            CONTENT="$CONTENT ${SUB_ARGS[idx]}"
+          else
+            CONTENT="${SUB_ARGS[idx]}"
+          fi
+          idx=$((idx+1))
+          ;;
+      esac
+    done
+
+    if [ -z "$CONTENT" ] && [ -z "$REPLY_TO" ] && [ -z "$REPOST_TO" ]; then
+      echo -e "${C_RED}❌ エラー: 本文を指定してください。${C_RESET}" >&2
+      exit 1
+    fi
+
+    # JSON ボディ作成
+    if command -v jq >/dev/null 2>&1; then
+      PAYLOAD=$(jq -n \
+        --arg content "$CONTENT" \
+        --arg visibility "$VISIBILITY" \
+        --arg replyTo "$REPLY_TO" \
+        --arg repostTo "$REPOST_TO" \
+        '{
+          content: $content,
+          visibility: $visibility
+        } + (if $replyTo != "" then {reply_to_id: ($replyTo | tonumber)} else {} end)
+          + (if $repostTo != "" then {repost_id: ($repostTo | tonumber)} else {} end)')
+    else
+      PAYLOAD="{\"content\":\"$CONTENT\",\"visibility\":\"$VISIBILITY\"}"
+    fi
+
+    RES=$(api_request POST "/posts" "$PAYLOAD")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        POST_ID=$(echo "$RES" | jq -r '.id // .post.id // empty' 2>/dev/null || true)
+        if [ -n "$POST_ID" ]; then
+          echo -e "${C_GREEN}✅ 投稿しました！ (#${POST_ID})${C_RESET}"
+        else
+          echo "$RES"
+        fi
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── タイムライン ──────────────────────────────────────────────────────────
+  tl|timeline)
+    LIMIT=20
+    TAB="foryou"
+
+    idx=0
+    while [[ $idx -lt ${#SUB_ARGS[@]} ]]; do
+      case "${SUB_ARGS[idx]}" in
+        -l|--limit)
+          LIMIT="${SUB_ARGS[idx+1]}"
+          idx=$((idx+2))
+          ;;
+        -t|--tab)
+          TAB="${SUB_ARGS[idx+1]}"
+          idx=$((idx+2))
+          ;;
+        *)
+          idx=$((idx+1))
+          ;;
+      esac
+    done
+
+    RES=$(api_request GET "/posts/page?mode=timeline&tab=${TAB}&limit=${LIMIT}")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '
+          (.posts // .)[] |
+          "┌─ \u001b[36m#\(.id)\u001b[0m \u001b[1m\(.user.name // .author.name // "No Name")\u001b[0m \u001b[2m(\(.user.nyaitter_id // .author.nyaitter_id // ("#" + (.user.id // .author.id | tostring))))  \(.created_at // .createdAt // "")\u001b[0m\n│  \(.content // "" | split("\n") | join("\n│  "))\n└─ \u001b[2m💬 \(.reply_count // .repliesCount // 0)  🔁 \(.repost_count // .repostsCount // 0)  ❤️ \(.like_count // .likesCount // 0)\u001b[0m\n"
+        ' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── ポスト詳細 ────────────────────────────────────────────────────────────
+  show)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter show <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request GET "/posts/${POST_ID}")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '
+          (.post // .) |
+          "┌─ \u001b[36m#\(.id)\u001b[0m \u001b[1m\(.user.name // .author.name // "No Name")\u001b[0m \u001b[2m(\(.user.nyaitter_id // .author.nyaitter_id // ("#" + (.user.id // .author.id | tostring))))  \(.created_at // .createdAt // "")\u001b[0m\n│  \(.content // "" | split("\n") | join("\n│  "))\n└─ \u001b[2m💬 \(.reply_count // .repliesCount // 0)  🔁 \(.repost_count // .repostsCount // 0)  ❤️ \(.like_count // .likesCount // 0)\u001b[0m"
+        ' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── 削除 ──────────────────────────────────────────────────────────────────
+  delete|del|rm)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter delete <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request DELETE "/posts/${POST_ID}")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_GREEN}🗑️ ポスト #${POST_ID} を削除しました。${C_RESET}"
+    fi
+    ;;
+
+  # ── いいね ────────────────────────────────────────────────────────────────
+  like)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter like <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request POST "/posts/${POST_ID}/like")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_RED}❤️ ポスト #${POST_ID} にいいねしました。${C_RESET}"
+    fi
+    ;;
+
+  unlike)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter unlike <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request DELETE "/posts/${POST_ID}/like")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_DIM}💔 ポスト #${POST_ID} のいいねを取り消しました。${C_RESET}"
+    fi
+    ;;
+
+  # ── リポスト ──────────────────────────────────────────────────────────────
+  repost)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter repost <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request POST "/posts/${POST_ID}/repost")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_GREEN}🔁 ポスト #${POST_ID} をリポストしました。${C_RESET}"
+    fi
+    ;;
+
+  unrepost)
+    POST_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$POST_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter unrepost <postId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request DELETE "/posts/${POST_ID}/repost")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_DIM}↩️ ポスト #${POST_ID} のリポストを取り消しました。${C_RESET}"
+    fi
+    ;;
+
+  # ── ユーザー ──────────────────────────────────────────────────────────────
+  user|u)
+    QUERY="${SUB_ARGS[0]:-}"
+    if [ -z "$QUERY" ]; then
+      echo -e "${C_RED}使用法: nyaitter user <userId|username>${C_RESET}" >&2
+      exit 1
+    fi
+
+    if [[ "$QUERY" =~ ^[0-9]+$ ]]; then
+      RES=$(api_request GET "/users/${QUERY}")
+    else
+      RES=$(api_request GET "/users/by-username/${QUERY}")
+    fi
+
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '
+          (.user // .) |
+          "👤 \u001b[1m\(.name // "No Name")\u001b[0m \u001b[2m(\(.nyaitter_id // ("#" + (.id|tostring))))\u001b[0m\n" +
+          "   Bio: \(.me // .bio // "なし")\n" +
+          "   Following: \(.following_count // .followingCount // 0) | Followers: \(.follower_count // .followersCount // 0) | Posts: \(.post_count // .postsCount // 0)"
+        ' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  follow)
+    USER_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$USER_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter follow <userId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request POST "/users/${USER_ID}/follow")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_GREEN}➕ ユーザー #${USER_ID} をフォローしました。${C_RESET}"
+    fi
+    ;;
+
+  unfollow)
+    USER_ID="${SUB_ARGS[0]:-}"
+    if [ -z "$USER_ID" ]; then
+      echo -e "${C_RED}使用法: nyaitter unfollow <userId>${C_RESET}" >&2
+      exit 1
+    fi
+    RES=$(api_request DELETE "/users/${USER_ID}/follow")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      echo -e "${C_DIM}➖ ユーザー #${USER_ID} のフォローを解除しました。${C_RESET}"
+    fi
+    ;;
+
+  following)
+    TARGET="${SUB_ARGS[0]:-me}"
+    LIMIT=20
+    if [ "$TARGET" = "me" ]; then
+      RES=$(api_request GET "/users/me/following?limit=${LIMIT}")
+    else
+      RES=$(api_request GET "/users/${TARGET}/following?limit=${LIMIT}")
+    fi
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '(.users // .)[] | "  - #\(.id) \(.name // "No Name") (@\(.username // "unknown"))"' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  followers)
+    TARGET="${SUB_ARGS[0]:-me}"
+    LIMIT=20
+    if [ "$TARGET" = "me" ]; then
+      RES=$(api_request GET "/users/me/followers?limit=${LIMIT}")
+    else
+      RES=$(api_request GET "/users/${TARGET}/followers?limit=${LIMIT}")
+    fi
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo "$RES" | jq -r '(.users // .)[] | "  - #\(.id) \(.name // "No Name") (@\(.username // "unknown"))"' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── 通知 ──────────────────────────────────────────────────────────────────
+  notif|notifications)
+    SUB="${SUB_ARGS[0]:-}"
+    if [ "$SUB" = "read" ]; then
+      NOTIF_ID="${SUB_ARGS[1]:-}"
+      if [ -n "$NOTIF_ID" ]; then
+        api_request POST "/notifications/${NOTIF_ID}/read" >/dev/null
+        echo -e "${C_GREEN}✅ 通知 #${NOTIF_ID} を既読にしました。${C_RESET}"
+      else
+        api_request POST "/notifications/read-all" >/dev/null
+        echo -e "${C_GREEN}✅ すべての通知を既読にしました。${C_RESET}"
+      fi
+      exit 0
+    fi
+
+    RES=$(api_request GET "/notifications?limit=20")
+    if [ "$OPT_JSON" -eq 1 ]; then
+      echo "$RES"
+    else
+      if command -v jq >/dev/null 2>&1; then
+        echo -e "${C_BOLD}🔔 通知一覧:${C_RESET}"
+        echo "$RES" | jq -r '
+          (.notifications // .)[] |
+          "  [#\(.id)] \u001b[33m\(.type)\u001b[0m - @\(.actor.username // .actor.name // "誰か") (\(.created_at // .createdAt // "")): \(.message // "")"
+        ' 2>/dev/null || echo "$RES"
+      else
+        echo "$RES"
+      fi
+    fi
+    ;;
+
+  # ── DM ────────────────────────────────────────────────────────────────────
+  dm)
+    ACTION="${SUB_ARGS[0]:-list}"
+    if [ "$ACTION" = "send" ]; then
+      TARGET_ID="${SUB_ARGS[1]:-}"
+      MSG="${SUB_ARGS[*]:2}"
+      if [ -z "$TARGET_ID" ] || [ -z "$MSG" ]; then
+        echo -e "${C_RED}使用法: nyaitter dm send <userId> <本文>${C_RESET}" >&2
+        exit 1
+      fi
+      if command -v jq >/dev/null 2>&1; then
+        PAYLOAD=$(jq -n --arg msg "$MSG" '{ content: $msg }')
+      else
+        PAYLOAD="{\"content\":\"$MSG\"}"
+      fi
+      RES=$(api_request POST "/dm/${TARGET_ID}/messages" "$PAYLOAD")
+      if [ "$OPT_JSON" -eq 1 ]; then
+        echo "$RES"
+      else
+        echo -e "${C_GREEN}✉️ DM を送信しました。${C_RESET}"
+      fi
+    else
+      RES=$(api_request GET "/dm")
+      if [ "$OPT_JSON" -eq 1 ]; then
+        echo "$RES"
+      else
+        if command -v jq >/dev/null 2>&1; then
+          echo -e "${C_BOLD}✉️ DM チャンネル一覧:${C_RESET}"
+          echo "$RES" | jq -r '(.channels // .)[] | "  - #\(.id) \(.name // .targetUser.name // "DM")"' 2>/dev/null || echo "$RES"
+        else
+          echo "$RES"
+        fi
+      fi
+    fi
+    ;;
+
+  *)
+    echo -e "${C_RED}未知のコマンド: \"$CMD\"${C_RESET}" >&2
+    echo -e "\"nyaitter --help\" でコマンド一覧を確認できます。" >&2
+    exit 1
+    ;;
+esac
